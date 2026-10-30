@@ -1,0 +1,577 @@
+{
+  "name": "B - Incident triage (webhook)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "triage",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1648,
+        -48
+      ],
+      "id": "4b4e7fc4-261c-41af-aed3-bbdac9917bc1"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- EDIT HERE ----\n// GEN_MODEL: same model name that worked in your Gemini test\n// LLM_MODE: 'live' = call Gemini for classify/plan, 'mock' = skip generation calls\n// MIN_SCORE: retrieval similarity cutoff (tune after looking at real scores)\nreturn [{ json: {\n  body: $input.first().json.body,\n  GEN_MODEL: 'gemini-3.5-flash-lite',\n  EMBED_MODEL: 'gemini-embedding-001',\n  LLM_MODE: 'live',\n  CONF_THRESHOLD: 0.6,\n  MIN_SCORE: 0.55\n}}];\n"
+      },
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1440,
+        -48
+      ],
+      "id": "5b5d5b1c-5ddc-495d-9aad-7da924d465f1"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH i AS (\n  INSERT INTO incidents(external_id, raw, source) VALUES ($1::text, $2::jsonb, 'api') RETURNING id\n)\nINSERT INTO audit_log(incident_id, actor, action, detail)\nSELECT id, 'system', 'received', '{}'::jsonb FROM i RETURNING incident_id AS id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.body && $json.body.id ? String($json.body.id) : null, JSON.stringify($json.body || {}) ] }}"
+        }
+      },
+      "name": "Insert Raw Incident",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -1552,
+        272
+      ],
+      "id": "29d9056b-eb22-4bae-99c1-f9c5bbc2fcbf"
+    },
+    {
+      "parameters": {
+        "jsCode": "const cfg = $('Config').first().json;\nconst raw = cfg.body || {};\nconst errors = [];\nif (!raw.id) errors.push('missing id');\nif (!raw.title) errors.push('missing title');\nif (!raw.description && !raw.logs) errors.push('missing description and logs');\nif (raw.timestamp && isNaN(Date.parse(raw.timestamp))) errors.push('bad timestamp');\nconst text = [raw.title, raw.description, raw.logs].filter(Boolean).join('\\n');\nreturn [{ json: { incident_id: $input.first().json.id, raw, valid: errors.length === 0, errors, text } }];\n"
+      },
+      "name": "Validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1264,
+        272
+      ],
+      "id": "73e11717-4b8c-4c49-ac13-dc1e409ae17f"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.valid }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "name": "Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        -912,
+        272
+      ],
+      "id": "5ba9cb8b-66fa-46f8-8ca7-ad57f3d77440"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH f AS (\n  INSERT INTO failed_records(incident_id, stage, reason, raw) VALUES ($1::int, 'validation', $2::text, $3::jsonb)\n), u AS (\n  UPDATE incidents SET status = 'failed' WHERE id = $1::int\n)\nINSERT INTO audit_log(incident_id, actor, action, detail) VALUES ($1::int, 'system', 'validation_failed', $4::jsonb) RETURNING incident_id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.incident_id, $json.errors.join('; '), JSON.stringify($json.raw), JSON.stringify({ errors: $json.errors }) ] }}"
+        }
+      },
+      "name": "Record Validation Failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -768,
+        544
+      ],
+      "id": "f275a504-1e94-4eb6-ae56-97cf743fd2cc"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ incident_id: $('Validate').first().json.incident_id, status: 'failed', errors: $('Validate').first().json.errors }) }}",
+        "options": {
+          "responseCode": 422
+        }
+      },
+      "name": "Respond 422",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -512,
+        544
+      ],
+      "id": "46efab37-27b8-41f0-85d6-98f6b22a735a"
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst rules = [\n  ['database', /deadlock|connection pool|too many connections|replication lag|slow quer/i],\n  ['disk_storage', /no space left|disk (usage )?9\\d%|inode/i],\n  ['memory', /\\boom\\b|oomkilled|out of memory|heap/i],\n  ['network', /\\b50[234]\\b|timed? ?out|dns|enotfound/i],\n  ['certificate', /ssl|tls|certificate|expired/i],\n  ['deployment', /deploy|rollback|release failed|rollout/i],\n  ['auth', /\\b40[13]\\b|invalid token|login failed|token expired/i],\n  ['cpu', /cpu (at )?9\\d%|high load|load average/i],\n];\nconst hit = rules.find(([, re]) => re.test(d.text));\nconst rule_severity = /outage|down|prod|critical|data loss/i.test(d.text) ? 'high' : 'medium';\nconst classify_prompt =\n  'You are an IT incident triage assistant. Classify the incident using ONLY the text below.\\n' +\n  'type must be one of: database, disk_storage, memory, network, certificate, deployment, auth, cpu, unknown (use unknown if none clearly fits).\\n' +\n  'severity must be one of: low, medium, high, critical.\\n' +\n  'confidence is a number from 0 to 1; lower it when the text is ambiguous.\\n' +\n  'evidence is up to 3 EXACT quotes copied from the text. Do not invent details.\\n\\n' +\n  'INCIDENT:\\n' + d.text;\nreturn [{ json: { ...d, rule_type: hit ? hit[0] : 'unknown', rule_severity, classify_prompt } }];\n"
+      },
+      "name": "Rules",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1088,
+        -176
+      ],
+      "id": "37026ffa-f3a4-4be4-a1b4-f2c6fc7e91d4"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $('Config').first().json.LLM_MODE }}",
+              "value2": "live"
+            }
+          ]
+        }
+      },
+      "name": "Live LLM?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        -1040,
+        80
+      ],
+      "id": "2b6e47b3-4504-4a05-9f0d-f90477213729"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $('Config').first().json.GEN_MODEL }}:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ contents: [{ parts: [{ text: $json.classify_prompt }] }], generationConfig: { temperature: 0.1, responseMimeType: 'application/json', responseSchema: { type: 'OBJECT', properties: { type: { type: 'STRING', enum: ['database','disk_storage','memory','network','certificate','deployment','auth','cpu','unknown'] }, severity: { type: 'STRING', enum: ['low','medium','high','critical'] }, confidence: { type: 'NUMBER' }, evidence: { type: 'ARRAY', items: { type: 'STRING' } } }, required: ['type','severity','confidence','evidence'] } } }) }}",
+        "options": {}
+      },
+      "name": "Gemini Classify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -752,
+        -112
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "id": "a83c3ce8-89a5-4d55-a2bb-f58a822d5e3b",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const cfg = $('Config').first().json;\nconst base = $('Rules').first().json;\nconst TYPES = ['database','disk_storage','memory','network','certificate','deployment','auth','cpu','unknown'];\nconst SEVS = ['low','medium','high','critical'];\nconst norm = s => String(s).replace(/\\s+/g, ' ').trim();\nlet c = null, method = 'llm';\nif (cfg.LLM_MODE === 'mock') {\n  c = { type: base.rule_type, severity: base.rule_severity, confidence: 0.7, evidence: [] };\n  method = 'mock';\n} else {\n  try {\n    const txt = $input.first().json.candidates[0].content.parts[0].text;\n    const p = JSON.parse(txt);\n    if (TYPES.includes(p.type) && SEVS.includes(p.severity) && typeof p.confidence === 'number' && Array.isArray(p.evidence)) c = p;\n  } catch (e) {}\n  if (!c) {\n    c = { type: base.rule_type, severity: base.rule_severity, confidence: 0.4, evidence: [] };\n    method = 'rules_fallback';\n  }\n}\n// keep only evidence that really appears in the incident text\nconst haystack = norm(base.text);\nconst evidence = (c.evidence || []).filter(e => typeof e === 'string' && haystack.includes(norm(e)));\nconst confidence = Math.round(Math.min(1, Math.max(0, Number(c.confidence))) * 100) / 100;\nconst reasons = [];\nif (confidence < cfg.CONF_THRESHOLD) reasons.push('low_confidence');\nif (c.type === 'unknown') reasons.push('unknown_type');\nif (method === 'rules_fallback') reasons.push('llm_failed_used_rules');\nif (method === 'llm' && evidence.length === 0) reasons.push('no_verified_evidence');\nif (method === 'llm' && base.rule_type !== 'unknown' && c.type !== base.rule_type) reasons.push('llm_rules_disagree');\nconst model = method === 'llm' ? cfg.GEN_MODEL : method;\nreturn [{ json: {\n  incident_id: base.incident_id, text: base.text,\n  type: c.type, severity: c.severity, confidence, evidence, method, model,\n  needs_review: reasons.length > 0, review_reasons: reasons\n}}];\n"
+      },
+      "name": "Parse Classification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -560,
+        96
+      ],
+      "id": "e408f309-dc95-4974-83ad-eaa4b96a00c2"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH c AS (\n  INSERT INTO classifications(incident_id, incident_type, severity, confidence, evidence, method, model)\n  VALUES ($1::int, $2::text, $3::text, $4::numeric, $5::jsonb, $6::text, $7::text)\n), u AS (\n  UPDATE incidents SET status = 'classified' WHERE id = $1::int\n)\nINSERT INTO audit_log(incident_id, actor, action, detail)\nVALUES ($1::int, CASE WHEN $6::text = 'llm' THEN 'gemini' ELSE 'system' END, 'classified', $8::jsonb) RETURNING incident_id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.incident_id, $json.type, $json.severity, $json.confidence, JSON.stringify($json.evidence), $json.method, $json.model, JSON.stringify({ needs_review: $json.needs_review, reasons: $json.review_reasons }) ] }}"
+        }
+      },
+      "name": "Save Classification",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -288,
+        16
+      ],
+      "id": "58b6ad8b-7f83-4240-b2ab-fbeb881fe4b1"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $('Config').first().json.EMBED_MODEL }}:embedContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'models/' + $('Config').first().json.EMBED_MODEL, content: { parts: [{ text: $('Parse Classification').first().json.text }] }, outputDimensionality: 768 }) }}",
+        "options": {}
+      },
+      "name": "Embed Incident",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -336,
+        400
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "id": "d76bdeed-75b3-4f5e-b67b-88ddc221cd65"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "(SELECT 'runbook' AS kind, r.title, c.content AS text,\n        round((1 - (c.embedding <=> $1::vector))::numeric, 3) AS score\n FROM runbook_chunks c JOIN runbooks r ON r.id = c.runbook_id\n ORDER BY c.embedding <=> $1::vector LIMIT 4)\nUNION ALL\n(SELECT 'past' AS kind, p.title, p.summary || ' Resolution: ' || p.resolution AS text,\n        round((1 - (p.embedding <=> $1::vector))::numeric, 3) AS score\n FROM past_incidents p ORDER BY p.embedding <=> $1::vector LIMIT 3)\nUNION ALL\n(SELECT 'actions' AS kind, r.title, c.content AS text, NULL::numeric AS score\n FROM runbook_chunks c JOIN runbooks r ON r.id = c.runbook_id\n WHERE c.runbook_id = (SELECT runbook_id FROM runbook_chunks ORDER BY embedding <=> $1::vector LIMIT 1)\n   AND c.content LIKE '## Recommended Actions%');",
+        "options": {
+          "queryReplacement": "={{ [ '[' + $json.embedding.values.join(',') + ']' ] }}"
+        }
+      },
+      "name": "Retrieve Context",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        48,
+        400
+      ],
+      "id": "cc881b31-3130-4b65-91c0-bd0b9fa59eb6"
+    },
+    {
+      "parameters": {
+        "jsCode": "const cfg = $('Config').first().json;\nconst p = $('Parse Classification').first().json;\nconst rows = $input.all().map(i => i.json);\nconst passing = r => Number(r.score) >= cfg.MIN_SCORE;\nconst runbooks = rows.filter(r => r.kind === 'runbook' && passing(r)).slice(0, 3);\nconst past = rows.filter(r => r.kind === 'past' && passing(r)).slice(0, 2);\nconst no_source = runbooks.length === 0;\nconst actions = no_source ? [] : rows.filter(r => r.kind === 'actions');\nconst best_score = Math.max(0, ...rows.filter(r => r.score !== null && r.score !== undefined).map(r => Number(r.score)));\nconst reasons = [...p.review_reasons];\nif (no_source) reasons.push('no_source_found');\nconst excerpts = [...runbooks, ...actions].map((r, i) => '[Runbook] ' + r.title + '\\n' + r.text).join('\\n\\n');\nconst pastText = past.map(r => '[Past incident] ' + r.title + '\\n' + r.text).join('\\n\\n');\nconst plan_prompt =\n  'You help an IT engineer troubleshoot. Use ONLY the excerpts below.\\n' +\n  'Return a troubleshooting plan of at most 6 steps. Each step has: step (short action), detail (one sentence), source (the EXACT title of the runbook or past incident it came from).\\n' +\n  'Steps are suggestions for a human engineer. Never propose automatic production changes; anything risky must say it needs human approval.\\n' +\n  'If the excerpts do not cover the problem, return fewer steps. Do not invent steps.\\n\\n' +\n  'INCIDENT:\\n' + p.text + '\\n\\nCLASSIFIED AS: ' + p.type + ' / ' + p.severity + '\\n\\n' +\n  'EXCERPTS:\\n' + excerpts + '\\n\\n' + pastText;\nreturn [{ json: {\n  ...p, runbooks, past, actions, no_source, best_score,\n  review_reasons: reasons, needs_review: p.needs_review || no_source,\n  call_llm: !no_source && cfg.LLM_MODE === 'live', plan_prompt\n}}];\n"
+      },
+      "name": "Collect Sources",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -32,
+        16
+      ],
+      "id": "252a416f-fe92-4246-afb5-24f7d14619d7"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.call_llm }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "name": "Call LLM for plan?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        256,
+        16
+      ],
+      "id": "e5d30157-3686-4197-947c-8e5c298acce5"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $('Config').first().json.GEN_MODEL }}:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ contents: [{ parts: [{ text: $json.plan_prompt }] }], generationConfig: { temperature: 0.1, responseMimeType: 'application/json', responseSchema: { type: 'ARRAY', items: { type: 'OBJECT', properties: { step: { type: 'STRING' }, detail: { type: 'STRING' }, source: { type: 'STRING' } }, required: ['step','detail','source'] } } } }) }}",
+        "options": {}
+      },
+      "name": "Gemini Plan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        176,
+        -256
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "id": "518be04a-cd4a-4a6e-8a54-4069772537ea",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('Collect Sources').first().json;\nconst resp = $input.first().json;\n\nconst titles = [\n  ...d.runbooks.map(r => r.title),\n  ...d.past.map(r => r.title)\n];\n\nconst normalizeTitle = (value) =>\n  String(value || '')\n    .replace(/^\\[[^\\]]*\\]\\s*/, '')\n    .replace(/^(runbook|past incident)\\s*:\\s*/i, '')\n    .trim();\n\nconst validTitles = new Set(titles.map(normalizeTitle));\nconst reasons = [...d.review_reasons];\n\nlet plan = [];\nlet plan_method = 'none';\n\nif (d.call_llm) {\n  try {\n    const arr = JSON.parse(\n      resp.candidates[0].content.parts[0].text\n    );\n\n    if (Array.isArray(arr)) {\n      plan = arr\n        .map(s => ({\n          step: String(s?.step || '').trim(),\n          detail: String(s?.detail || '').trim(),\n          source: normalizeTitle(s?.source)\n        }))\n        .filter(s =>\n          s.step &&\n          s.detail &&\n          validTitles.has(s.source)\n        )\n        .slice(0, 6);\n    }\n\n    if (plan.length) {\n      plan_method = 'llm';\n    }\n  } catch (e) {\n    // Invalid or unexpected Gemini response; use fallback below.\n  }\n}\n\nif (!plan.length && !d.no_source) {\n  // Extractive fallback: Recommended Actions bullets from retrieved runbooks.\n  for (const r of d.actions || []) {\n    const bullets = String(r.text || '')\n      .split('\\n')\n      .filter(line => line.startsWith('- '));\n\n    for (const line of bullets) {\n      plan.push({\n        step: line.slice(2).trim(),\n        detail: '',\n        source: r.title\n      });\n    }\n  }\n\n  plan = plan.slice(0, 6);\n\n  if (plan.length) {\n    plan_method = d.call_llm\n      ? 'extractive_fallback'\n      : 'extractive';\n  }\n\n  if (d.call_llm && plan.length && !reasons.includes('plan_llm_failed')) {\n    reasons.push('plan_llm_failed');\n  }\n}\n\nconst seen = {};\n\n[\n  ...d.runbooks.map(r => ({\n    kind: 'runbook',\n    title: r.title,\n    score: Number(r.score)\n  })),\n  ...d.past.map(r => ({\n    kind: 'past_incident',\n    title: r.title,\n    score: Number(r.score)\n  }))\n].forEach(s => {\n  const key = s.kind + '|' + s.title;\n\n  if (!seen[key] || s.score > seen[key].score) {\n    seen[key] = s;\n  }\n});\n\nconst sources = Object.values(seen);\n\nconst needs_review =\n  d.needs_review ||\n  reasons.includes('plan_llm_failed');\n\nreturn [{\n  json: {\n    incident_id: d.incident_id,\n    type: d.type,\n    severity: d.severity,\n    confidence: d.confidence,\n    method: d.method,\n    plan,\n    plan_method,\n    sources,\n    review_reasons: reasons,\n    needs_review,\n    status: needs_review ? 'needs_review' : 'planned',\n    best_score: d.best_score\n  }\n}];"
+      },
+      "name": "Parse Plan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        608,
+        32
+      ],
+      "id": "31b58792-19a5-469e-8f32-becef90c3db8"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH rec AS (\n  INSERT INTO recommendations(incident_id, plan, sources) VALUES ($1::int, $2::jsonb, $3::jsonb)\n), u AS (\n  UPDATE incidents SET status = $4::text WHERE id = $1::int\n)\nINSERT INTO audit_log(incident_id, actor, action, detail) VALUES ($1::int, 'system', 'plan_generated', $5::jsonb) RETURNING incident_id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.incident_id, JSON.stringify($json.plan), JSON.stringify($json.sources), $json.status, JSON.stringify({ plan_method: $json.plan_method, reasons: $json.review_reasons, best_score: $json.best_score }) ] }}"
+        }
+      },
+      "name": "Save Recommendation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        288,
+        400
+      ],
+      "id": "64bf8e52-63d2-4cda-b9cf-961a4181141f"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ incident_id: $('Parse Plan').first().json.incident_id, status: $('Parse Plan').first().json.status, type: $('Parse Plan').first().json.type, severity: $('Parse Plan').first().json.severity, confidence: $('Parse Plan').first().json.confidence, method: $('Parse Plan').first().json.method, needs_review: $('Parse Plan').first().json.needs_review, review_reasons: $('Parse Plan').first().json.review_reasons, plan_method: $('Parse Plan').first().json.plan_method, steps: $('Parse Plan').first().json.plan.length, sources: $('Parse Plan').first().json.sources.map(s => s.title), best_score: $('Parse Plan').first().json.best_score }) }}",
+        "options": {}
+      },
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        544,
+        400
+      ],
+      "id": "29e4f414-3d6a-4ab6-abfe-a0124710f700"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Insert Raw Incident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Raw Incident": {
+      "main": [
+        [
+          {
+            "node": "Validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate": {
+      "main": [
+        [
+          {
+            "node": "Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid?": {
+      "main": [
+        [
+          {
+            "node": "Rules",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Validation Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Validation Failure": {
+      "main": [
+        [
+          {
+            "node": "Respond 422",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rules": {
+      "main": [
+        [
+          {
+            "node": "Live LLM?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live LLM?": {
+      "main": [
+        [
+          {
+            "node": "Gemini Classify",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Parse Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Classify": {
+      "main": [
+        [
+          {
+            "node": "Parse Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Classification": {
+      "main": [
+        [
+          {
+            "node": "Save Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Classification": {
+      "main": [
+        [
+          {
+            "node": "Embed Incident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed Incident": {
+      "main": [
+        [
+          {
+            "node": "Retrieve Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retrieve Context": {
+      "main": [
+        [
+          {
+            "node": "Collect Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Sources": {
+      "main": [
+        [
+          {
+            "node": "Call LLM for plan?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call LLM for plan?": {
+      "main": [
+        [
+          {
+            "node": "Gemini Plan",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Parse Plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Plan": {
+      "main": [
+        [
+          {
+            "node": "Parse Plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Plan": {
+      "main": [
+        [
+          {
+            "node": "Save Recommendation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Recommendation": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "meta": {},
+  "tags": []
+}
