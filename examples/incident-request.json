@@ -1,0 +1,8 @@
+{
+  "id": "INC-2026-1042",
+  "title": "Production API returning intermittent 502 errors",
+  "description": "Users report intermittent failures when accessing the production API. Requests sometimes return HTTP 502 and latency has increased since the latest deployment.",
+  "logs": "upstream timed out; intermittent 502 responses",
+  "timestamp": "2026-10-30T05:00:00Z",
+  "source": "api-demo"
+}
