@@ -4,7 +4,7 @@ An n8n workflow that accepts IT incidents through a webhook, validates the paylo
 
 **Built by Optimity Logics**
 
-![Optimity Logics — AI IT Incident Triage & Root-Cause Copilot](assets/banners/incident-triage-banner.png)
+![Optimity Logics — AI IT Incident Triage & Root-Cause Copilot](assets/banners/incident-triage-banner.svg)
 
 ## Capabilities
 
@@ -32,8 +32,8 @@ An n8n workflow that accepts IT incidents through a webhook, validates the paylo
 │   └── setup.md
 └── assets/
     └── banners/
-        ├── incident-triage-banner.png
-        └── incident-triage-end-banner.png
+        ├── incident-triage-banner.svg
+        └── incident-triage-end-banner.svg
 ```
 
 ## Requirements
