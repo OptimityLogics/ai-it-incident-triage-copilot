@@ -6,6 +6,12 @@ An n8n workflow that accepts IT incidents through a webhook, validates the paylo
 
 ![Optimity Logics — AI IT Incident Triage & Root-Cause Copilot](assets/banners/incident-triage-banner.svg)
 
+## Demo Video
+
+▶️ **Watch the AI IT Incident Triage Copilot demo:** [YouTube Demo](https://youtu.be/hefKV9lYFP8)
+
+See the workflow in action and explore how AI-assisted incident analysis and n8n orchestration can support structured IT incident triage.
+
 ## Capabilities
 
 - **Webhook intake:** receives incident reports over `POST /triage`.
